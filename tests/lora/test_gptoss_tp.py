@@ -88,23 +88,12 @@ def generate_and_test(llm: vllm.LLM, lora_path: str, lora_id: int) -> None:
         generated_texts.append(generated_text)
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
     for i in range(len(EXPECTED_LORA_OUTPUT)):
-        assert generated_texts[i].startswith(EXPECTED_LORA_OUTPUT[i])
+        assert generated_texts[i].startswith(EXPECTED_LORA_OUTPUT[i]), (
+            f"generated: '{generated_texts[i]}', expected: '{EXPECTED_LORA_OUTPUT[i]}'"
+        )
 
 
-# TODO: make the Mxfp4MoeBackend.TRITON spawn-safe.
-# For now just use TRITON_UNFUSED kernel
-@pytest.mark.parametrize(
-    "mxfp4_use_marlin",
-    [
-        False,
-        pytest.param(
-            True,
-            marks=pytest.mark.skipif(
-                current_platform.is_rocm(), reason="marlin not supported"
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("mxfp4_use_marlin", [True, False])
 @pytest.mark.parametrize("specialize_active_lora", [True, False])
 def test_gpt_oss_lora(
     gptoss20b_lora_files,
@@ -133,18 +122,7 @@ def test_gpt_oss_lora(
 
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize("fully_sharded_loras", [False, True])
-@pytest.mark.parametrize(
-    "mxfp4_use_marlin",
-    [
-        False,
-        pytest.param(
-            True,
-            marks=pytest.mark.skipif(
-                current_platform.is_rocm(), reason="marlin not supported"
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("mxfp4_use_marlin", [True, False])
 def test_gpt_oss_lora_tp2(
     gptoss20b_lora_files,
     fully_sharded_loras,

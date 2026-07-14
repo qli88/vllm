@@ -193,8 +193,25 @@ def select_wna16_moe_backend(
     runner_backend = config.moe_backend
     if runner_backend != "auto":
         requested_backend = map_wna16_backend(runner_backend)
-        return _return_or_raise(
-            requested_backend, config, weight_key, None, activation_format
+        # Check whether any kernel for the requested backend supports the
+        # current platform + config before committing to it.  On ROCm,
+        # MARLIN has no valid kernel (MarlinExperts._supports_current_device
+        # requires CUDA), so we warn and fall through to auto selection
+        # rather than crashing.
+        for k_cls in backend_to_kernel_cls(requested_backend):
+            supported, _ = k_cls.is_supported_config(
+                k_cls, config, weight_key, None, activation_format
+            )
+            if supported:
+                return _return_or_raise(
+                    requested_backend, config, weight_key, None, activation_format
+                )
+        logger.warning(
+            "moe_backend='%s' is not supported on %s "
+            "(no kernel passed is_supported_config); "
+            "falling back to auto backend selection.",
+            runner_backend,
+            current_platform.device_name,
         )
 
     # Select kernels in order of backend.

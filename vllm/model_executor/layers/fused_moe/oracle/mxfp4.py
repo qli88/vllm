@@ -492,7 +492,15 @@ def select_mxfp4_moe_backend(
             except ValueError as e:
                 last_error = e
         assert last_error is not None
-        raise last_error
+        # No kernel for the requested backend works on this platform/config.
+        # Warn and fall through to auto selection instead of crashing.
+        logger.warning(
+            "moe_backend='%s' is not supported on %s "
+            "(%s); falling back to auto backend selection.",
+            runner_backend,
+            current_platform.device_name,
+            last_error,
+        )
 
     # Select kernels in order of backend.
     AVAILABLE_BACKENDS = _filter_by_activation(

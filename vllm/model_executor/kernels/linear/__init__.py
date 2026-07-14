@@ -553,11 +553,14 @@ def choose_scaled_mm_linear_kernel(
     if linear_backend != "auto":
         filtered = _filter_kernels_by_backend(linear_backend, platform_kernels)
         if not filtered:
-            raise ValueError(
-                f"--linear-backend={linear_backend} was requested but no "
-                f"'{linear_backend}' kernel exists for this layer type."
+            logger.warning(
+                "--linear-backend=%s has no kernels available for "
+                "ScaledMM layers on %s; falling back to auto selection.",
+                linear_backend,
+                current_platform.device_name,
             )
-        platform_kernels = filtered
+        else:
+            platform_kernels = filtered
 
     for kernel in platform_kernels:
         is_supported_and_can_implement, failure_reason = (
@@ -717,11 +720,14 @@ def choose_mp_linear_kernel(
     if linear_backend != "auto":
         filtered = _filter_kernels_by_backend(linear_backend, platform_kernels)
         if not filtered:
-            raise ValueError(
-                f"--linear-backend={linear_backend} was requested but no "
-                f"'{linear_backend}' kernel exists for mixed-precision layers."
+            logger.warning(
+                "--linear-backend=%s has no kernels available for "
+                "mixed-precision layers on %s; falling back to auto selection.",
+                linear_backend,
+                current_platform.device_name,
             )
-        platform_kernels = filtered
+        else:
+            platform_kernels = filtered
 
     failure_reasons = []
     for kernel in platform_kernels:
