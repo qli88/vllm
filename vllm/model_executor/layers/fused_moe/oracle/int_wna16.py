@@ -92,8 +92,12 @@ def backend_to_kernel_cls(
         from vllm.model_executor.layers.fused_moe.experts.int4_emulation_moe import (
             Int4EmulationTritonExperts,
         )
+        from vllm.model_executor.layers.fused_moe.experts.int8_emulation_moe import (
+            Int8EmulationTritonExperts,
+        )
 
-        return [Int4EmulationTritonExperts]
+        # Oracle tries each in order; _supports_quant_scheme selects the right one.
+        return [Int4EmulationTritonExperts, Int8EmulationTritonExperts]
     else:
         raise ValueError(f"Unknown WNA16 MoE backend: {backend.value}")
 
@@ -284,13 +288,17 @@ def make_wna16_moe_kernel(
     from vllm.model_executor.layers.fused_moe.experts.int4_emulation_moe import (
         Int4EmulationTritonExperts,
     )
+    from vllm.model_executor.layers.fused_moe.experts.int8_emulation_moe import (
+        Int8EmulationTritonExperts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
         XPUExpertsWNA16,
     )
 
     # Currently, we only support TrtLlmMxint4ExpertsMonolithic, MarlinExperts,
     # BatchedMarlinExperts, XPUExpertsWNA16, CPUExpertsInt4, the Humming
-    # grouped/indexed experts, and Int4EmulationTritonExperts
+    # grouped/indexed experts, Int4EmulationTritonExperts, and
+    # Int8EmulationTritonExperts
     allowed_experts: tuple[type[mk.FusedMoEExperts], ...] = (
         MarlinExperts,
         BatchedMarlinExperts,
@@ -298,6 +306,7 @@ def make_wna16_moe_kernel(
         XPUExpertsWNA16,
         CPUExpertsInt4,
         Int4EmulationTritonExperts,
+        Int8EmulationTritonExperts,
     )
     if backend == WNA16MoEBackend.HUMMING:
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
@@ -1168,6 +1177,118 @@ def _unpack_and_dequant_int4_awq(
     return w_dequant.contiguous()  # [E, K, N]
 
 
+def _unpack_and_dequant_int8_gptq(
+    w_int32: torch.Tensor,
+    scale: torch.Tensor,
+    transpose_output: bool,
+    output_dtype: torch.dtype = torch.bfloat16,
+    force_torch: bool = False,
+) -> torch.Tensor:
+    """Unpack GPTQ-packed int8 weights and dequantize to output_dtype.
+
+    GPTQ packs 4 int8 values per int32, LSB-first along the K (row) dimension.
+    Uses a Triton kernel when available (no intermediate allocations on GPU);
+    falls back to a pure-PyTorch implementation otherwise.
+
+    Args:
+        w_int32: packed weights, shape [E, K_packed, N] where K_packed = K//4.
+        scale:   per-group scales, shape [E, K//group_size, N], float16.
+        transpose_output: if True return [E, N, K]; if False return [E, K, N].
+        output_dtype: target floating-point dtype (bfloat16 or float16).
+        force_torch: force to use torch int8 dequant instead of Triton version.
+
+    Returns:
+        Dequantized weight tensor in the requested layout.
+    """
+
+    if not force_torch:
+        from vllm.model_executor.layers.fused_moe.experts.int8_emulation_moe import (
+            triton_unpack_and_dequant_int8_gptq,
+        )
+
+        return triton_unpack_and_dequant_int8_gptq(
+            w_int32, scale, transpose_output, output_dtype
+        )
+
+    # PyTorch fallback
+    E, K_packed, N = w_int32.shape
+    K = K_packed * 4
+
+    # Unpack: [E, K_packed, N] -> [E, K_packed, N, 4] via byte extraction.
+    # Each int32 holds 4 uint8 values (0..255) packed LSB-first along K.
+    shifts = torch.arange(4, device=w_int32.device, dtype=torch.int32) * 8
+    bytes_ = (w_int32.unsqueeze(-1) >> shifts) & 0xFF  # [E, K_packed, N, 4]
+
+    # Fuse K_packed and byte index into K: permute to [E, K_packed, 4, N]
+    w = bytes_.permute(0, 1, 3, 2).reshape(E, K, N).to(torch.int16)
+
+    # uint8b128: subtract bias 128 so range is [-128, 127]
+    w = w - 128
+
+    # Broadcast scale [E, K//gs, N] -> [E, K, N]
+    # Multiply in float32 (same as Triton kernel) then cast, so both paths
+    # produce identical results for the same input.
+    gs = K // scale.shape[1]
+    scale_broadcast = scale.repeat_interleave(gs, dim=1).to(torch.float32)
+
+    w_dequant = (w.to(torch.float32) * scale_broadcast).to(output_dtype)  # [E, K, N]
+
+    if transpose_output:
+        return w_dequant.permute(0, 2, 1).contiguous()  # [E, N, K]
+    return w_dequant.contiguous()  # [E, K, N]
+
+
+def _process_weights_emulation_int8(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> tuple:
+    """Dequantize int8 weights for the emulation backend.
+
+    Inputs are in GPTQ packed format (pack_factor=4):
+        w13: [E, K//4, 2*N]   int32  (gate+up proj stacked on dim 2)
+        w2:  [E, N//4, K]     int32
+        w13_scale: [E, K//gs, 2*N]  float16
+        w2_scale:  [E, N//gs, K]    float16
+
+    Outputs (what TritonExperts expects):
+        w13_out: [E, 2*N, K]  output_dtype
+        w2_out:  [E, K, N]    output_dtype
+    """
+    # w13: packed along K (dim 1), cols are 2*N (dim 2)
+    # transpose_output=True yields [E, 2*N, K]
+    w13_bf16 = _unpack_and_dequant_int8_gptq(
+        w13, w13_scale, transpose_output=True, output_dtype=output_dtype
+    )
+
+    # w2: packed along N (dim 1 is N//4), cols are K (dim 2)
+    # After unpacking get [E, N, K]; permute to [E, K, N] for TritonExperts
+    w2_unpacked = _unpack_and_dequant_int8_gptq(
+        w2, w2_scale, transpose_output=False, output_dtype=output_dtype
+    )  # [E, N, K]
+    w2_bf16 = w2_unpacked.permute(0, 2, 1).contiguous()  # [E, K, N]
+
+    dummy = torch.ones(1, dtype=torch.float16, device=w13.device)
+    return (
+        w13_bf16,
+        w2_bf16,
+        dummy,  # w13_scales  (unused; nulled in Int8EmulationTritonExperts)
+        dummy,  # w2_scales   (unused)
+        None,  # w13_g_idx
+        None,  # w2_g_idx
+        None,  # w13_g_idx_sort_indices
+        None,  # w2_g_idx_sort_indices
+        None,  # w13_qzeros
+        None,  # w2_qzeros
+        None,  # w13_input_global_scale
+        None,  # w2_input_global_scale
+        None,  # w13_bias
+        None,  # w2_bias
+    )
+
+
 def _process_weights_emulation_gptq(
     w13: torch.Tensor,
     w2: torch.Tensor,
@@ -1175,8 +1296,9 @@ def _process_weights_emulation_gptq(
     w2_scale: torch.Tensor,
     w13_qzeros: torch.Tensor | None,
     w2_qzeros: torch.Tensor | None,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple:
-    """Dequantize int4 weights to BF16 for the emulation backend.
+    """Dequantize int4 weights for the emulation backend.
 
     Inputs are in GPTQ packed format:
         w13: [E, K//8, 2*N]   int32  (gate+up proj stacked on dim 2)
@@ -1185,20 +1307,20 @@ def _process_weights_emulation_gptq(
         w2_scale:  [E, N//gs, K]    float16
 
     Outputs (what TritonExperts expects):
-        w13_out: [E, 2*N, K]  bfloat16
-        w2_out:  [E, K, N]    bfloat16
+        w13_out: [E, 2*N, K]  output_dtype
+        w2_out:  [E, K, N]    output_dtype
     """
     # w13: packed along K (dim 1), output cols are 2*N (dim 2)
     # transpose_output=True yields [E, 2*N, K]
     w13_bf16 = _unpack_and_dequant_int4_gptq(
-        w13, w13_scale, w13_qzeros, transpose_output=True
+        w13, w13_scale, w13_qzeros, transpose_output=True, output_dtype=output_dtype
     )
 
     # w2: packed along N (dim 1 is N//8), output cols are K (dim 2)
     # After unpacking we get [E, N, K]; we want [E, K, N] for TritonExperts
     # transpose_output=False gives [E, N, K], then we permute once more
     w2_unpacked = _unpack_and_dequant_int4_gptq(
-        w2, w2_scale, w2_qzeros, transpose_output=False
+        w2, w2_scale, w2_qzeros, transpose_output=False, output_dtype=output_dtype
     )  # [E, N, K]
     w2_bf16 = w2_unpacked.permute(0, 2, 1).contiguous()  # [E, K, N]
 
@@ -1228,8 +1350,9 @@ def _process_weights_emulation_awq(
     w2_scale: torch.Tensor,
     w13_qzeros: torch.Tensor | None,
     w2_qzeros: torch.Tensor | None,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple:
-    """Dequantize AWQ int4 weights to BF16 for the emulation backend.
+    """Dequantize AWQ int4 weights for the emulation backend.
 
     AWQ inputs:
         w13: [E, K, 2*N//8]       int32  (packed along N, gate+up on dim 2)
@@ -1238,13 +1361,13 @@ def _process_weights_emulation_awq(
         w2_scale:  [E, N//gs, K]    float16
 
     Outputs (what TritonExperts expects):
-        w13_out: [E, 2*N, K]  bfloat16
-        w2_out:  [E, K, N]    bfloat16
+        w13_out: [E, 2*N, K]  output_dtype
+        w2_out:  [E, K, N]    output_dtype
     """
     # w13: AWQ-packed along N (dim 2), K is unpacked in dim 1
     # _unpack_and_dequant_int4_awq with transpose_output=True yields [E, 2*N, K]
     w13_bf16 = _unpack_and_dequant_int4_awq(
-        w13, w13_scale, w13_qzeros, transpose_output=True
+        w13, w13_scale, w13_qzeros, transpose_output=True, output_dtype=output_dtype
     )
 
     # w2: AWQ packs along K (dim 2 is K//8), N is unpacked in dim 1.
@@ -1253,7 +1376,7 @@ def _process_weights_emulation_awq(
     # packed dim is columns. Treat dim 1 as rows and dim 2 as N_packed:
     # unpacking gives [E, N, K]. Then permute to [E, K, N].
     w2_unpacked = _unpack_and_dequant_int4_awq(
-        w2, w2_scale, w2_qzeros, transpose_output=False
+        w2, w2_scale, w2_qzeros, transpose_output=False, output_dtype=output_dtype
     )  # [E, N, K]
     w2_bf16 = w2_unpacked.permute(0, 2, 1).contiguous()  # [E, K, N]
 
@@ -1274,6 +1397,37 @@ def _process_weights_emulation_awq(
         None,
         None,
     )
+
+
+def _infer_num_bits(
+    quant_config,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+) -> int:
+    """Infer weight bit-width for the emulation path.
+
+    Reads from quant_config (num_bits or weight_bits attribute). If neither is
+    available, infers from the packed/scale shape ratio:
+      int4: pack_factor=8 -> K_packed = K//8, ratio K_packed/n_groups = gs/8
+      int8: pack_factor=4 -> K_packed = K//4, ratio K_packed/n_groups = gs/4
+    The ratio for int8 is exactly 2times that of int4 for the same group_size,
+    so if K_packed * 8 % n_groups == 0 we assume int4, else int8.
+    """
+    for attr in ("num_bits", "weight_bits"):
+        val = getattr(quant_config, attr, None)
+        if val is not None:
+            return int(val)
+    # Shape-based fallback: w13=[E, K_packed, 2N], scale=[E, n_groups, 2N]
+    # K_packed * pack_factor = K = n_groups * group_size
+    # int4: K_packed * 8 = n_groups * group_size -> K_packed/n_groups = gs/8
+    # int8: K_packed * 4 = n_groups * group_size -> K_packed/n_groups = gs/4
+    # For any valid group_size that is a multiple of 8, int4 always satisfies
+    # K_packed * 8 % n_groups == 0.  If it doesn't, it must be int8.
+    K_packed = w13.shape[1]
+    n_groups = w13_scale.shape[1]
+    if n_groups > 0 and (K_packed * 8) % n_groups == 0:
+        return 4
+    return 8
 
 
 def convert_to_wna16_moe_kernel_format(
@@ -1463,6 +1617,23 @@ def convert_to_wna16_moe_kernel_format(
             w2_bias_out,
         )
     elif backend == WNA16MoEBackend.EMULATION:
+        # Use the model's activation dtype (FusedMoEConfig.in_dtype) so weights
+        # and activations share the same dtype at forward time, avoiding a
+        # per-call cast in apply(). in_dtype is always set on FusedMoEConfig;
+        # input_dtype is unreliable (callers may set it to None).
+        float_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+        in_dtype = getattr(getattr(layer, "moe_config", None), "in_dtype", None)
+        output_dtype = in_dtype if in_dtype in float_dtypes else torch.bfloat16
+        num_bits = _infer_num_bits(quant_config, w13, w13_scale)
+        if num_bits == 8:
+            return _process_weights_emulation_int8(
+                w13,
+                w2,
+                w13_scale,
+                w2_scale,
+                output_dtype=output_dtype,
+            )
+        # int4 path (AWQ or GPTQ)
         from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 
         if isinstance(quant_config, AutoAWQConfig):
@@ -1473,6 +1644,7 @@ def convert_to_wna16_moe_kernel_format(
                 w2_scale,
                 w13_qzeros,
                 w2_qzeros,
+                output_dtype=output_dtype,
             )
         return _process_weights_emulation_gptq(
             w13,
@@ -1481,6 +1653,7 @@ def convert_to_wna16_moe_kernel_format(
             w2_scale,
             w13_qzeros,
             w2_qzeros,
+            output_dtype=output_dtype,
         )
     else:
         raise ValueError(f"Unsupported wna16 MoE backend: {backend.value}")

@@ -113,8 +113,9 @@ class QuantKey:
 
     def __str__(self):
         scale2_str = f"scale2({self.scale2})," if self.scale2 else ""
+        dtype_str = fx.graph.dtype_abbrs.get(self.dtype, str(self.dtype))
         return (
-            f"QuantKey({fx.graph.dtype_abbrs[self.dtype]},"
+            f"QuantKey({dtype_str},"
             f"scale({self.scale}),{scale2_str}"
             f"{'a' if not self.symmetric else ''}symmetric)"
         )
