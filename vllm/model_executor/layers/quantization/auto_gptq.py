@@ -61,6 +61,7 @@ from vllm.model_executor.parameter import (
     PackedvLLMParameter,
     RowvLLMParameter,
 )
+from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.config import get_safetensors_params_metadata
 from vllm.utils.collection_utils import is_list_of
@@ -246,6 +247,23 @@ class AutoGPTQConfig(QuantizationConfig):
             if not check_moe_marlin_supports_layer(
                 layer, self.group_size, allow_tile_padding=not self.desc_act
             ):
+                if current_platform.is_rocm():
+                    # ROCm doesn't support marlin. So if marlin is specified on ROCm,
+                    # we should use emulation instead, and also warn user meantime.
+                    # TODO: We need to update logic here to fully honor
+                    # --moe-backend option
+                    if layer.moe_config.moe_backend == "marlin":
+                        logger.warning_once(
+                            "marlin moe-backend is not supported on ROCm platform. "
+                            "Falling back to emulation moe-backend."
+                        )
+                        layer.moe_config.moe_backend = "emulation"
+                    if layer.moe_config.moe_backend == "emulation":
+                        moe_quant_method = get_moe_quant_method(
+                            self, layer, prefix, AutoGPTQMoEMethod
+                        )
+                        return moe_quant_method
+
                 logger.warning_once(
                     f"Layer '{prefix}' is not supported by GPTQMoeMarlin. "
                     "Falling back to Moe WNA16 kernels."
@@ -253,6 +271,7 @@ class AutoGPTQConfig(QuantizationConfig):
                 return MoeWNA16Config.from_config(self.full_config).get_quant_method(
                     layer, prefix
                 )
+
             moe_quant_method = get_moe_quant_method(
                 self, layer, prefix, AutoGPTQMoEMethod
             )
