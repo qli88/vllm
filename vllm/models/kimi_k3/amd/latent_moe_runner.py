@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner, _unpack
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.torch_utils import aux_stream
 
 logger = init_logger(__name__)
 
@@ -29,11 +32,20 @@ class ROCmLatentMoERunner(MoERunner):
     ) -> None:
         super().__init__(*args, **kwargs)
 
+        # Events for the shared-AR || up-proj-GEMM overlap in _shard_up_proj_tail.
+        # Pre-allocated here (not lazily) so graph capture sees a stable object.
+        self._shared_ar_events = (torch.cuda.Event(), torch.cuda.Event())
+
         transform = self.routed_output_transform
         up_proj = getattr(transform, "up_proj", None)
         tp_size = self.moe_config.tp_size
 
         self._up_proj_shard_size = 0
+        # Mirrors NVIDIA _use_fused_path() with two AMD-specific extra guards:
+        #   up_proj.weight.shape[0] % tp_size == 0  — column-parallel sharding requires
+        #       exact divisibility; NVIDIA Tier-1 uses the full weight so needs none.
+        #   routed_scaling_factor == 1.0  — non-unit scaling would require an extra
+        #       multiply not yet wired into the sharded tail path.
         self._tail_shardable = (
             up_proj is not None
             and tp_size > 1
@@ -73,6 +85,8 @@ class ROCmLatentMoERunner(MoERunner):
         transform = self.routed_output_transform
         assert transform is not None
 
+        # Latent allreduce + norm. NVIDIA uses allreduce_norm_latent_out (fused
+        # via FlashInfer, CUDA/SM100 only); AMD uses sequential allreduce then norm.
         latent = tensor_model_parallel_all_reduce(fused_output)
         if transform.norm is not None:
             latent = transform.norm(latent)
@@ -82,10 +96,39 @@ class ROCmLatentMoERunner(MoERunner):
         up_proj_shard = transform.up_proj.weight.narrow(0, shard_start, shard_size)
         hidden_shard = shared_output.narrow(-1, shard_start, shard_size)
 
-        # hidden_shard += latent @ up_proj_shard.T, accumulated in the GEMM's
-        # beta-add epilogue so folding in the shared partial costs no kernel.
-        hidden_shard.addmm_(latent, up_proj_shard.t())
+        # AMD-only overlap: NVIDIA Tier-2 runs addmm_+allreduce sequentially
+        # ("the reduce has to follow the accumulate"). We reorder validly because
+        # allreduce(shared_output) and mm(latent, up_proj_shard.t()) touch
+        # independent memory; after join, hidden_shard.add_(up_proj_result) gives
+        # the same element-wise result as sequential addmm_ then allreduce.
+        # Guard matches NVIDIA Tier-1 threshold so the overlap only fires at
+        # decode batch sizes where RCCL latency is worth hiding.
+        _aux = aux_stream()
+        if (
+            _aux is not None
+            and shared_output.size(0) <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            and not envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM
+        ):
+            #   fn0 (default stream): up-proj GEMM — new tensor, independent of shared_output.
+            #   fn1 (aux stream):     shared-expert allreduce (RCCL/xGMI) — in-place.
+            up_proj_result, _ = maybe_execute_in_parallel(
+                lambda: torch.mm(latent, up_proj_shard.t()),
+                lambda: tensor_model_parallel_all_reduce(shared_output),
+                self._shared_ar_events[0],
+                self._shared_ar_events[1],
+                _aux,
+            )
+            hidden_shard.add_(up_proj_result)
+            # shared_output is fully reduced by fn1; output_is_reduced=True skips
+            # the second allreduce in _maybe_reduce_final_output.
+            return self._maybe_reduce_final_output(
+                shared_output, trunc_size, output_is_reduced=True
+            )
 
+        # Sequential path (large batch, stream disabled, or no aux stream).
+        # Matches NVIDIA Tier-2 for the accumulate+allreduce order: addmm_ first,
+        # then _maybe_reduce_final_output handles the allreduce.
+        hidden_shard.addmm_(latent, up_proj_shard.t())
         return self._maybe_reduce_final_output(
             shared_output, trunc_size, output_is_reduced=False
         )
