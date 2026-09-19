@@ -638,6 +638,16 @@ class SharedTopkIndicesBuffer:
         self._indexer = None
         self._topk_indices_buffer = buffer
 
+    def record_logical_topk_ready(self) -> None:
+        """Record top-k readiness for backends without an index group.
+
+        Backends that synchronize top-k production through an index group
+        override this hook in their concrete implementation.  Other sparse
+        MLA backends only need the shared buffer and intentionally have no
+        readiness state to update.
+        """
+        pass
+
 
 class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic[T]):
     """Sparse MLA base with dense and masked-MHA prefill paths."""

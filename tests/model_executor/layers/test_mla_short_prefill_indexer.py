@@ -9,12 +9,21 @@ import torch
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 import vllm.models.deepseek_v32.attention as deepseek_attention
 from vllm.config import CUDAGraphMode
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SharedTopkIndicesBuffer,
+)
 from vllm.models.deepseek_v32 import attention as deepseek_v32_attention
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
+
+
+def test_sparse_backend_without_index_group_can_record_topk_ready() -> None:
+    impl = SharedTopkIndicesBuffer()
+
+    assert impl.record_logical_topk_ready() is None
 
 
 def test_sparse_attention_refreshes_batch_state_inside_eager_segment(
